@@ -59,6 +59,29 @@ def daterange(start: pd.Timestamp, end: pd.Timestamp):
         d += timedelta(days=1)
 
 
+BLOCK_LENGTH_DAYS = 4
+
+GROUP_QUOTAS = {
+    "Ops Leadership": {
+        "roles": {
+            "Duty Manager",
+            "Operations Lead",
+        },
+        "quota": 2,
+    },
+    "Ops Support": {
+        "roles": {
+            "Flight Support",
+            "Flight Support Lead",
+            "Flight Follower",
+            "Travel Coordinator",
+            "Operations Control Lead",
+        },
+        "quota": 2,
+    },
+}
+
+
 def clean_requests(df: pd.DataFrame) -> pd.DataFrame:
     cols = {c.lower(): c for c in df.columns}
     required = ["employee", "role", "start_date", "end_date", "rank"]
@@ -87,6 +110,11 @@ def clean_requests(df: pd.DataFrame) -> pd.DataFrame:
     df2 = df2.reset_index(drop=True)
     df2["request_id"] = df2.index.astype(str)
     df2["days"] = (df2["end_date"] - df2["start_date"]).dt.days + 1
+
+    if (df2["days"] != BLOCK_LENGTH_DAYS).any():
+        raise ValueError(
+            f"All requests must be exactly {BLOCK_LENGTH_DAYS} consecutive days to align with the 4-on/4-off schedule."
+        )
     return df2
 
 
@@ -111,10 +139,12 @@ st.set_page_config(page_title="Vacation Solver (Prototype)", layout="wide")
 st.title("Vacation Bidding & Optimization — Prototype")
 
 st.markdown(
-    """
+"""
 This prototype allocates vacation **requests (whole blocks)** using an optimization model:
 - Maximizes weighted satisfaction by **rank** (1 = top choice → higher weight).
 - Enforces **daily quotas** overall and optionally by **role**.
+- Requires **4-day blocks** to match the 4-on/4-off schedule.
+- Applies built-in **role group caps** (Ops Leadership + Ops Support limited to 2 off per day).
 - Adds **fairness** by penalizing deviation from a target awarded days per person.
 
 **Tip:** Start with the sample, then upload your CSV. Tune weights/quotas/fairness in the sidebar and re-run.
@@ -136,6 +166,10 @@ with st.sidebar:
     global_quota = st.number_input("Max people off per day (global)", min_value=1, value=3, step=1)
 
     st.caption("Optional per-role daily quotas. Leave blank for none.")
+    st.caption(
+        "Built-in groups: Ops Leadership (Duty Manager + Operations Lead) and Ops Support "
+        "(Flight Support family) are each limited to 2 people off per day."
+    )
     role_quota_text = st.text_area(
         "Role quotas (JSON dict, e.g. {\"Dispatcher\": 2, \"Duty Manager\": 1})",
         value=""
@@ -163,36 +197,48 @@ with st.sidebar:
 
 st.subheader("1) Load Requests")
 
+st.caption(
+    f"Vacation bids must be submitted in {BLOCK_LENGTH_DAYS}-day blocks to mirror the 4-on/4-off schedule."
+)
+
 sample = pd.DataFrame({
     "employee": [
-        "Alice", "Alice", "Alice",
-        "Bob", "Bob",
-        "Chris",
-        "Dee",
-        "Evan",
+        "Avery", "Avery",
+        "Brook",
+        "Casey",
+        "Devon",
+        "Emery",
+        "Finn",
+        "Gray",
     ],
     "role": [
-        "Duty Manager", "Duty Manager", "Duty Manager",
-        "Dispatcher", "Dispatcher",
-        "Dispatcher",
-        "Ops Controller",
-        "Ops Controller",
+        "Duty Manager", "Operations Lead",
+        "Flight Support",
+        "Flight Support Lead",
+        "Flight Follower",
+        "Travel Coordinator",
+        "Operations Control Lead",
+        "Flight Support",
     ],
     "start_date": [
-        "2025-07-15", "2025-12-24", "2025-08-05",
-        "2025-07-22", "2025-12-26",
+        "2025-07-01", "2025-07-09",
+        "2025-07-05",
+        "2025-07-13",
+        "2025-07-17",
+        "2025-07-21",
+        "2025-07-25",
         "2025-07-29",
-        "2025-07-15",
-        "2025-07-18",
     ],
     "end_date": [
-        "2025-07-21", "2025-12-28", "2025-08-07",
-        "2025-07-26", "2025-12-30",
-        "2025-08-02",
-        "2025-07-19",
-        "2025-07-21",
+        "2025-07-04", "2025-07-12",
+        "2025-07-08",
+        "2025-07-16",
+        "2025-07-20",
+        "2025-07-24",
+        "2025-07-28",
+        "2025-08-01",
     ],
-    "rank": [1, 1, 3, 2, 1, 2, 1, 3],
+    "rank": [1, 3, 1, 2, 1, 2, 3, 2],
 })
 
 col1, col2 = st.columns([1,1])
@@ -279,6 +325,17 @@ if st.button("Run Optimization"):
                     reqs_role_d = rows_d.loc[rows_d["role"] == role, "request_id"].unique().tolist()
                     if reqs_role_d:
                         model += pulp.lpSum([x[r] for r in reqs_role_d]) <= int(cap), f"role_{role}_{d.date()}"
+
+        # 2b) Fixed role group quotas
+        for d in D:
+            rows_d = df_days[df_days["date"] == d]
+            for group_name, cfg in GROUP_QUOTAS.items():
+                reqs_group_d = rows_d.loc[rows_d["role"].isin(cfg["roles"]), "request_id"].unique().tolist()
+                if reqs_group_d:
+                    model += (
+                        pulp.lpSum([x[r] for r in reqs_group_d])
+                        <= int(cfg["quota"])
+                    ), f"group_{group_name}_{d.date()}"
 
         # 3) Define awarded days y[e]
         for e in E:
