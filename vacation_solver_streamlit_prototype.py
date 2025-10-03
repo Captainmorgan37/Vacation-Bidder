@@ -187,6 +187,32 @@ with st.sidebar:
     fairness_lambda = st.number_input("Fairness penalty (L1)", min_value=0.0, value=0.2, step=0.1,
                                       help="Higher = stronger push toward equal awarded days around the target.")
 
+    st.subheader("Seniority Minimums")
+    st.caption(
+        "Optionally require a minimum number of awarded days for specific employees (multiples of 4)."
+    )
+    seniority_json = st.text_area(
+        "Minimum days per employee (JSON, e.g. {\"Avery\": 8, \"Brook\": 4})",
+        value="",
+    )
+    min_days_per_employee: Dict[str, int] = {}
+    if seniority_json.strip():
+        try:
+            parsed = dict(pd.read_json(io.StringIO(seniority_json), typ="series"))
+            for name, days in parsed.items():
+                if pd.isna(days):
+                    continue
+                days_int = int(days)
+                if days_int % BLOCK_LENGTH_DAYS != 0:
+                    st.warning(
+                        f"Minimum days for {name} must be a multiple of {BLOCK_LENGTH_DAYS}. Ignoring this entry."
+                    )
+                    continue
+                min_days_per_employee[name] = days_int
+        except Exception:
+            st.warning("Could not parse minimum days JSON. Ignoring.")
+            min_days_per_employee = {}
+
     st.subheader("Other")
     season_start = st.date_input("Season start (optional, for calendar view)")
     season_end = st.date_input("Season end (optional, for calendar view)")
@@ -346,6 +372,11 @@ if st.button("Run Optimization"):
         for e in E:
             model += y[e] - float(fairness_target) == dev_pos[e] - dev_neg[e]
 
+        # 5) Minimum awarded days by seniority (optional)
+        for e in E:
+            if e in min_days_per_employee:
+                model += y[e] >= float(min_days_per_employee[e]), f"min_days_{e}"
+
         # Solve
         solver = pulp.PULP_CBC_CMD(msg=False)
         result_status = model.solve(solver)
@@ -365,7 +396,19 @@ if st.button("Run Optimization"):
         days=("days", "sum"),
         avg_rank=("rank", "mean"),
         total_value=("value", "sum")
-    ).reset_index().sort_values(["days", "total_value"], ascending=[False, False])
+    ).reset_index()
+
+    all_people = df_req[["employee", "role"]].drop_duplicates()
+    sum_emp = (
+        all_people.merge(sum_emp, on=["employee", "role"], how="left")
+        .fillna({"requests": 0, "days": 0, "avg_rank": 0, "total_value": 0})
+    )
+    sum_emp["requests"] = sum_emp["requests"].astype(int)
+    sum_emp["days"] = sum_emp["days"].astype(int)
+    sum_emp = sum_emp.sort_values(["days", "total_value"], ascending=[False, False])
+
+    if min_days_per_employee:
+        sum_emp["min_days_required"] = sum_emp["employee"].map(min_days_per_employee).fillna(0).astype(int)
 
     colA, colB = st.columns([1,1])
     with colA:
@@ -451,6 +494,7 @@ st.markdown(
 - To strongly discourage long blocks, add a negative weight proportional to days, or cap `days` per request in preprocessing.
 - For **blackout periods** (e.g., special events), we can inject day-level constraints that set the quota to 0 or a lower cap.
 - For **seniority** weighting, add an employee-specific coefficient in the objective.
+- To guarantee senior employees receive more time off, use the sidebar's *Seniority Minimums* to require minimum awarded days per person (in 4-day blocks).
 - For **carry-over fairness** year‑to‑year, store prior awarded days and shift each employee’s target accordingly.
 """
 )
